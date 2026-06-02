@@ -9,3 +9,16 @@
 #SBATCH --output=output/iNGP-%A.out
 
 source $HOME/miniconda3/start1260.sh
+conda activate instant_ngp_sh
+
+(
+    cd $HOME/instantNGP-SH
+    SCENE="bicycle"
+
+    python -m instant_ngp_sh.train \
+        --data $HOME/mipnerf/$SCENE \
+        --out out/$SCENE \
+        --sh_degree 3 \
+        --near 0.2 \
+        --far 100.0 \
+)
