@@ -300,7 +300,10 @@ class ColmapDataset:
             _warn_if_distorted(cam)
 
             # Pose: COLMAP stores world-to-camera (R, t); we want camera-to-world.
-            R = qvec2rotmat(it["qvec"])          # world->camera
+            # x_c = R * x_w + t   -->   R^T (x_c -t) = x_w
+            # c2w =     [ R^T   -t ] 
+            #           [ 0     1  ] 
+            R = qvec2rotmat(it["qvec"])
             t = it["tvec"]
             c2w = np.eye(4, dtype=np.float64)
             c2w[:3, :3] = R.T
@@ -370,6 +373,7 @@ class ColmapDataset:
     def sample_rays(self, batch_size, generator=None):
         device = self.images.device
         n = self.num_images()
+        # sample random pixels in random images
         img_idx = torch.randint(0, n, (batch_size,), generator=generator, device=device)
         y = torch.randint(0, self.H, (batch_size,), generator=generator, device=device)
         x = torch.randint(0, self.W, (batch_size,), generator=generator, device=device)
@@ -377,6 +381,7 @@ class ColmapDataset:
 
         dirs = torch.stack(
             [
+                # + 0.5 for pixel center
                 (x.float() + 0.5 - self.cx[img_idx]) / self.fx[img_idx],
                 (y.float() + 0.5 - self.cy[img_idx]) / self.fy[img_idx],
                 torch.ones(batch_size, device=device),
@@ -399,7 +404,7 @@ class ColmapDataset:
     def compute_aabb(self, padding: float = 0.1) -> torch.Tensor:
         """Robust AABB around the scene, from the sparse points if available.
 
-        Uses the 0.5–99.5 percentile of the point cloud to ignore COLMAP outliers, then
+        Uses the 0.5-99.5 percentile of the point cloud to ignore COLMAP outliers, then
         pads by ``padding`` of the extent. Falls back to the camera positions.
         """
         if self.point_xyz is not None and self.point_xyz.shape[0] >= 8:
