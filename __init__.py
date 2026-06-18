@@ -1,24 +1,24 @@
-"""Standalone Instant-NGP SH field.
+"""Standalone Instant-NGP radiance field.
 
-A self-contained extraction of the Instant-NGP neural texture used in Nexels: a
-multi-resolution hash grid + small MLP (via tiny-cuda-nn) that maps a 3D world
-position to spherical-harmonics (SH) coefficients encoding a view-dependent color.
+A self-contained, canonical Instant-NGP NeRF (via tiny-cuda-nn): a multi-resolution
+hash grid encodes the 3D world position for a small density MLP, the view direction is
+encoded with spherical harmonics (SH), and a small color MLP maps the geometric feature
++ SH-encoded direction to an RGB color.
 
 Typical use:
 
-    from instant_ngp_sh import InstantNGPSHField, FieldConfig, sh_to_rgb
+    from instant_ngp_sh import InstantNGPField, FieldConfig
 
-    field = InstantNGPSHField(aabb=[-1.5, -1.5, -1.5, 1.5, 1.5, 1.5],
-                              config=FieldConfig(sh_degree=3))
-    density, sh = field(positions)        # positions: [N, 3] world coords
-    rgb = sh_to_rgb(sh, view_dirs)        # [N, 3] in [0, 1]
+    field = InstantNGPField(aabb=[-1.5, -1.5, -1.5, 1.5, 1.5, 1.5],
+                            config=FieldConfig(sh_degree=4))
+    density, rgb = field(positions, directions)   # both [N, 3] world coords / dirs
 
-The SH coefficients are the model's primary output; the density head is only used by
-the included volumetric trainer (``train.py``) and can be ignored or disabled
-(``FieldConfig(predict_density=False)``) when you supply your own geometry.
+The density head is used by the included volumetric trainer (``train.py``) and can be
+disabled (``FieldConfig(predict_density=False)``) to use the field purely as a
+position+direction -> RGB texture when you supply your own geometry.
 """
 
-from .model import FieldConfig, InstantNGPSHField, trunc_exp
+from .model import FieldConfig, InstantNGPField, trunc_exp
 from .sh import (
     RGB2SH,
     SH2RGB,
@@ -35,7 +35,7 @@ from .rendering import (
 from .colmap import ColmapDataset, get_rays_pinhole
 
 __all__ = [
-    "InstantNGPSHField",
+    "InstantNGPField",
     "FieldConfig",
     "trunc_exp",
     "eval_sh",

@@ -1,9 +1,9 @@
-"""Minimal NeRF-style volume renderer for an :class:`InstantNGPSHField`.
+"""Minimal NeRF-style volume renderer for an :class:`InstantNGPField`.
 
-This is what lets you train the position -> SH field from posed images alone: rays
-are marched through the volume, the field is queried for density + SH coefficients at
-each sample, the SH coefficients are converted to RGB using the ray direction, and the
-samples are alpha-composited. No external geometry is required.
+This is what lets you train the radiance field from posed images alone: rays are
+marched through the volume, the field is queried for density + RGB at each sample
+(the view direction is fed into the field's color MLP), and the samples are
+alpha-composited. No external geometry is required.
 
 The renderer is intentionally small and dependency-free (plain stratified sampling, no
 occupancy grid). Pass the scene ``aabb`` (derived from the COLMAP sparse point cloud): the
@@ -19,10 +19,8 @@ from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
 
-from .sh import sh_to_rgb
-
-# A field maps positions [N, 3] -> (density [N, 1], sh_coeffs [N, K, 3]).
-FieldFn = Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
+# A field maps (positions [N, 3], directions [N, 3]) -> (density [N, 1], rgb [N, 3]).
+FieldFn = Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]
 
 # near/far may be a scalar (shared by all rays) or a per-ray [N] tensor.
 Bound = Union[float, torch.Tensor]
@@ -104,7 +102,6 @@ def volume_render_rays(
     near: float,
     far: float,
     n_samples: int,
-    sh_degree: int,
     bg_color: Optional[torch.Tensor] = None,
     perturb: bool = False,
     aabb: Optional[torch.Tensor] = None,
@@ -112,13 +109,12 @@ def volume_render_rays(
     """Volume-render a (small) batch of rays through ``field``.
 
     Args:
-        field: callable ``positions[N,3] -> (density[N,1], sh_coeffs[N,K,3])``.
+        field: callable ``(positions[N,3], directions[N,3]) -> (density[N,1], rgb[N,3])``.
         rays_o, rays_d: ``[N, 3]`` ray origins / directions (directions need not be
-            normalized; the SH view direction is normalized internally).
+            normalized; the field normalizes the view direction internally).
         near, far: scalar scene bounds (and the near floor / fallback for rays that miss
             ``aabb``).
         n_samples: samples per ray.
-        sh_degree: SH degree to evaluate.
         bg_color: ``[3]`` background color composited behind the rays (default black).
         perturb: stratified jitter (training).
         aabb: optional ``[6]`` box. If given, samples are placed between each ray's
@@ -143,13 +139,12 @@ def volume_render_rays(
     else:
         pts, t_vals = sample_along_rays(rays_o, rays_d, near, far, n_samples, perturb)
 
-    density, sh = field(pts.reshape(-1, 3))
-    density = density.reshape(n_rays, n_samples)
-    sh = sh.reshape(n_rays, n_samples, -1, 3)
-
-    # View direction is shared by all samples on a ray.
+    # View direction is shared by all samples on a ray; the field's color MLP
+    # consumes it (SH-encoded) to produce a view-dependent RGB per sample.
     viewdirs = rays_d[:, None, :].expand(n_rays, n_samples, 3)
-    rgb = sh_to_rgb(sh, viewdirs, degree=sh_degree, clamp=True)  # [N, S, 3]
+    density, rgb = field(pts.reshape(-1, 3), viewdirs.reshape(-1, 3))
+    density = density.reshape(n_rays, n_samples)
+    rgb = rgb.reshape(n_rays, n_samples, 3)  # [N, S, 3]
 
     # Distance between consecutive samples (scaled by ray length so density is in
     # world units). The final interval is set to a large value (open to infinity).
@@ -184,7 +179,6 @@ def render_image(
     near: float,
     far: float,
     n_samples: int,
-    sh_degree: int,
     bg_color: Optional[torch.Tensor] = None,
     chunk: int = 1 << 15,   # 32k rays; safe on 40 GiB A100 when images stay on CPU
     aabb: Optional[torch.Tensor] = None,
@@ -213,7 +207,6 @@ def render_image(
             near=near,
             far=far,
             n_samples=n_samples,
-            sh_degree=sh_degree,
             bg_color=bg_color,
             perturb=False,
             aabb=aabb,

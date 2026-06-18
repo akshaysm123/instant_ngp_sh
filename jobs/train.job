@@ -32,13 +32,13 @@ python -u -m instant_ngp_sh.train \
     --near 0.2 \
     --far 100.0
 
-echo ""
-echo "=== Full-dataset evaluation ==="
+# echo ""
+# echo "=== Full-dataset evaluation ==="
 
-python -u -m instant_ngp_sh.render \
-    --data "$DATA" \
-    --ckpt "$CKPT" \
-    --out "$OUT/render" \
-    --split train \
-    --images_dir images_4 \
-    --downscale 1
+# python -u -m instant_ngp_sh.render \
+#     --data "$DATA" \
+#     --ckpt "$CKPT" \
+#     --out "$OUT/render" \
+#     --split train \
+#     --images_dir images_4 \
+#     --downscale 1

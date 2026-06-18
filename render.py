@@ -1,4 +1,4 @@
-"""Render a trained Instant-NGP SH field on a COLMAP split and report PSNR.
+"""Render a trained Instant-NGP radiance field on a COLMAP split and report PSNR.
 
     python -m instant_ngp_sh.render --data /path/to/garden --ckpt runs/garden/field.pt --split test
 
@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover
     import imageio
 
 from .colmap import ColmapDataset
-from .model import FieldConfig, InstantNGPSHField
+from .model import FieldConfig, InstantNGPField
 from .rendering import render_image
 
 
@@ -35,7 +35,7 @@ def mse_to_psnr(mse: float) -> float:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Render a trained Instant-NGP SH field")
+    p = argparse.ArgumentParser(description="Render a trained Instant-NGP radiance field")
     p.add_argument("--data", required=True,
                    help="scene dir with images/ and sparse/0/*.bin")
     p.add_argument("--ckpt", required=True, help="path to field.pt checkpoint")
@@ -59,7 +59,7 @@ def main():
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
     config = FieldConfig(**ckpt["config"])
-    field = InstantNGPSHField(aabb=ckpt["aabb"], config=config).to(device)
+    field = InstantNGPField(aabb=ckpt["aabb"], config=config).to(device)
     field.load_state_dict(ckpt["state_dict"])
     field.eval()
 
@@ -96,7 +96,6 @@ def main():
             near=dataset.near,
             far=dataset.far,
             n_samples=args.n_samples,
-            sh_degree=config.sh_degree,
             bg_color=dataset.bg_color.to(device) if dataset.bg_color is not None else None,
             aabb=render_aabb,
         )

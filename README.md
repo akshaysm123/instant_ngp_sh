@@ -1,33 +1,35 @@
-# Instant-NGP SH Field (standalone)
+# Instant-NGP Radiance Field (standalone)
 
-A self-contained extraction of the **Instant-NGP neural texture** used in
-*Nexels: Neurally-Textured Surfels*. It is a multi-resolution hash-grid encoding
-(Instant-NGP) followed by a small fully-fused MLP, implemented with NVIDIA's
+A self-contained, **canonical Instant-NGP NeRF**, implemented with NVIDIA's
 [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn).
 
-The field maps a **3D world position → spherical-harmonics (SH) coefficients** that
-encode a view-dependent color. A helper converts those coefficients into an RGB color
-given a viewing direction. There is **no splatting / surfel code** here — just the
-neural field, a NeRF-style volume renderer to train it, and a loader for the
-**COLMAP / MipNeRF360** dataset format (`images/` + `sparse/0/*.bin`).
+Following the original Instant-NGP design, the **3D world position** is encoded with a
+multi-resolution hash grid and fed to a small *density* MLP (producing a density plus a
+geometric feature vector), while the **view direction** is encoded with spherical
+harmonics (SH); the geometric feature and the SH-encoded direction are concatenated and
+fed to a small *color* MLP that outputs **a single RGB color**. There is **no splatting /
+surfel code** here — just the neural field, a NeRF-style volume renderer to train it, and
+a loader for the **COLMAP / MipNeRF360** dataset format (`images/` + `sparse/0/*.bin`).
 
 ```
-position (x,y,z) ──► hash grid ──► MLP ──► SH coefficients ──(+ view dir)──► RGB
+position (x,y,z) ─► hash grid ─► density MLP ─► (density, feature) ┐
+                                                                   ├─► color MLP ─► RGB
+view dir (x,y,z) ─► SH encoding ───────────────────────────────────┘
 ```
 
 ## What's in the box
 
 | File | Purpose |
 |------|---------|
-| `model.py` | `InstantNGPSHField` — the hash grid + MLP. Output is SH coefficients (+ an optional density head). |
-| `sh.py` | `sh_to_rgb`, `eval_sh`, `SH2RGB`/`RGB2SH` — SH ↔ RGB conversions. |
+| `model.py` | `InstantNGPField` — hash-grid + density MLP and SH-direction + color MLP. Output is RGB (+ a density head). |
+| `sh.py` | `eval_sh`, `sh_to_rgb`, `SH2RGB`/`RGB2SH` — SH ↔ RGB helpers (not used by the field; kept for convenience). |
 | `rendering.py` | `volume_render_rays` / `render_image` — minimal NeRF volume renderer with ray–AABB sampling. |
 | `colmap.py` | `ColmapDataset` — reads a COLMAP model (`cameras/images/points3D.bin`, MipNeRF360 / 3DGS layout) + ray generation. |
 | `train.py` | training entry point. |
 | `render.py` | render/evaluate a trained checkpoint. |
 
 To reuse the field in your own project, just copy this folder and
-`from instant_ngp_sh import InstantNGPSHField, sh_to_rgb`.
+`from instant_ngp_sh import InstantNGPField`.
 
 ## Install
 
@@ -45,23 +47,23 @@ pip install --no-build-isolation \
 
 ```python
 import torch
-from instant_ngp_sh import InstantNGPSHField, FieldConfig, sh_to_rgb
+from instant_ngp_sh import InstantNGPField, FieldConfig
 
 # AABB used to normalize world positions into the unit cube.
-field = InstantNGPSHField(
+field = InstantNGPField(
     aabb=[-1.5, -1.5, -1.5, 1.5, 1.5, 1.5],
-    config=FieldConfig(sh_degree=3),          # 16 SH coeffs -> 48 output channels
+    config=FieldConfig(sh_degree=4),          # SH degree of the direction encoding
 ).cuda()
 
 positions = torch.rand(4096, 3, device="cuda") * 3 - 1.5   # [N, 3] world coords
-density, sh = field(positions)                # density: [N,1], sh: [N, 16, 3]
-
-view_dirs = torch.randn(4096, 3, device="cuda")
-rgb = sh_to_rgb(sh, view_dirs, degree=3)      # [N, 3] in [0, 1]
+view_dirs = torch.randn(4096, 3, device="cuda")            # [N, 3] view directions
+density, rgb = field(positions, view_dirs)    # density: [N,1], rgb: [N,3] in [0,1]
 ```
 
-**The model output is the SH color** (`sh`, shape `[..., K, 3]` with `K=(deg+1)**2`).
-`sh_to_rgb` applies the Nexels/3DGS convention `rgb = clamp(0.5 + eval_sh(sh, dir), 0, 1)`.
+**The model output is RGB directly** (`rgb`, shape `[..., 3]`, sigmoid-activated). The
+view direction is normalized internally and SH-encoded (`config.sh_degree`, tcnn
+convention: `degree**2` features) before being fed to the color MLP, as in the original
+Instant-NGP.
 
 ### About the density head
 
@@ -69,12 +71,12 @@ To train this field from posed images *alone* (a COLMAP dataset, no externally p
 geometry), volume rendering is required, which needs a density. The field therefore
 includes a small density head, used only by the volume renderer.
 
-If you already have geometry (e.g. surfels / Gaussians) you can ignore `density` and use
-only the SH output, or disable the head entirely:
+If you already have geometry (e.g. surfels / Gaussians) you can ignore `density`, or
+disable the head entirely — the field then returns RGB only:
 
 ```python
-field = InstantNGPSHField(aabb=..., config=FieldConfig(predict_density=False))
-sh = field(positions)            # returns SH coefficients only
+field = InstantNGPField(aabb=..., config=FieldConfig(predict_density=False))
+rgb = field(positions, view_dirs)            # returns RGB only
 ```
 
 ## Training (COLMAP / MipNeRF360 format)
@@ -91,7 +93,7 @@ scene/
 
 ```bash
 python -m instant_ngp_sh.train --data /path/to/garden --out runs/garden \
-    --images_dir images_4 --downscale 1 --sh_degree 3
+    --images_dir images_4 --downscale 1 --sh_degree 4
 ```
 
 Notes:
@@ -118,13 +120,14 @@ python -m instant_ngp_sh.render --data /path/to/garden --ckpt runs/garden/field.
 
 This renders every view in the split, reports per-view and mean PSNR, and saves PNGs.
 
-## Notes & differences from Nexels
+## Notes
 
-- Nexels uses a **custom CUDA hash-grid** kernel (with a surfel-specific antialiasing
-  term) plus the tcnn MLP. This standalone module uses **tcnn's native `HashGrid`
-  encoding** instead, so there is no custom CUDA extension to build — only `tcnn`. The
-  hash-grid hyper-parameters (16 levels × 2 features, `2^21` table, resolutions 16→1024)
-  and the MLP (64-wide, 2 hidden layers, ReLU) match the Nexels defaults.
+- This module uses **tcnn's native `HashGrid` and `SphericalHarmonics` encodings** plus
+  two fully-fused MLPs, so there is no custom CUDA extension to build — only `tcnn`. The
+  hash-grid hyper-parameters (16 levels × 2 features, `2^21` table, resolutions 16→1024),
+  the density MLP (64-wide, 1 hidden layer → density + 15-D feature), the SH direction
+  encoding (degree 4 → 16 features) and the color MLP (64-wide, 2 hidden layers, ReLU,
+  sigmoid output) follow the standard Instant-NGP / nerfstudio defaults.
 - tcnn's `HashGrid` expects inputs in `[0, 1]³`, so positions are normalized with the
   AABB (`normalize_positions`). The AABB is a robust box around the COLMAP sparse point
   cloud. Override via the `aabb` argument for your own scenes.

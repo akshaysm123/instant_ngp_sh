@@ -1,9 +1,10 @@
-"""Train the Instant-NGP SH field on a COLMAP (MipNeRF360 / 3DGS) scene.
+"""Train the Instant-NGP radiance field on a COLMAP (MipNeRF360 / 3DGS) scene.
 
-The field maps a 3D world position to SH coefficients (a view-dependent color). To
-supervise it from posed images alone, we volume-render rays (using the field's density
-head) and minimize the photometric error against the ground-truth pixels. The scene AABB
-(from the COLMAP sparse point cloud) bounds per-ray sampling.
+The field maps a 3D world position + view direction to an RGB color (the direction is
+SH-encoded and fed to the color MLP). To supervise it from posed images alone, we
+volume-render rays (using the field's density head) and minimize the photometric error
+against the ground-truth pixels. The scene AABB (from the COLMAP sparse point cloud)
+bounds per-ray sampling.
 
 Run as a module (recommended)::
 
@@ -38,7 +39,7 @@ except Exception:  # pragma: no cover
     import imageio
 
 from .colmap import ColmapDataset
-from .model import FieldConfig, InstantNGPSHField
+from .model import FieldConfig, InstantNGPField
 from .rendering import render_image, volume_render_rays
 
 
@@ -64,14 +65,21 @@ def parse_args():
     p.add_argument("--far", type=float, default=None,
                    help="ray far bound (auto-estimated from the scene if omitted)")
     p.add_argument("--max_train_images", type=int, default=None)
-    # Field / SH.
-    p.add_argument("--sh_degree", type=int, default=3)
+    # Field.
+    p.add_argument("--sh_degree", type=int, default=4,
+                   help="degree of the SH view-direction encoding (tcnn: degree**2 features)")
     p.add_argument("--log2_hashmap_size", type=int, default=21)
     p.add_argument("--n_levels", type=int, default=16)
     p.add_argument("--base_resolution", type=int, default=16)
     p.add_argument("--max_resolution", type=int, default=1024)
+    p.add_argument("--geo_feat_dim", type=int, default=15,
+                   help="geometric feature width passed from the density MLP to the color MLP")
     p.add_argument("--mlp_hidden_dim", type=int, default=64)
-    p.add_argument("--mlp_hidden_layers", type=int, default=2)
+    p.add_argument("--mlp_hidden_layers", type=int, default=1,
+                   help="hidden layers in the density MLP")
+    p.add_argument("--color_mlp_hidden_dim", type=int, default=64)
+    p.add_argument("--color_mlp_hidden_layers", type=int, default=2,
+                   help="hidden layers in the color MLP")
     # Optimization.
     p.add_argument("--iters", type=int, default=20000)
     p.add_argument("--batch", type=int, default=8192, help="rays per iteration")
@@ -90,18 +98,21 @@ def parse_args():
     return p.parse_args()
 
 
-def build_field(args, aabb) -> InstantNGPSHField:
+def build_field(args, aabb) -> InstantNGPField:
     config = FieldConfig(
         sh_degree=args.sh_degree,
         n_levels=args.n_levels,
         log2_hashmap_size=args.log2_hashmap_size,
         base_resolution=args.base_resolution,
         max_resolution=args.max_resolution,
+        geo_feat_dim=args.geo_feat_dim,
         mlp_hidden_dim=args.mlp_hidden_dim,
         mlp_num_hidden_layers=args.mlp_hidden_layers,
+        color_mlp_hidden_dim=args.color_mlp_hidden_dim,
+        color_mlp_num_hidden_layers=args.color_mlp_hidden_layers,
         predict_density=True,
     )
-    return InstantNGPSHField(aabb=aabb, config=config)
+    return InstantNGPField(aabb=aabb, config=config)
 
 
 @torch.no_grad()
@@ -120,7 +131,6 @@ def evaluate(field, dataset, args, device, out_dir, step, render_aabb=None, max_
             near=dataset.near,
             far=dataset.far,
             n_samples=args.n_samples,
-            sh_degree=args.sh_degree,
             bg_color=dataset.bg_color.to(device) if dataset.bg_color is not None else None,
             chunk=args.eval_chunk,
             aabb=render_aabb,
@@ -197,7 +207,6 @@ def main():
             near=train_set.near,
             far=train_set.far,
             n_samples=args.n_samples,
-            sh_degree=args.sh_degree,
             bg_color=bg,
             perturb=True,
             aabb=render_aabb,
