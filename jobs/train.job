@@ -29,8 +29,8 @@ python -u -m instant_ngp_sh.train \
     --sh_degree 3 \
     --batch 16384 \
     --eval_chunk 32768 \
-    --near 0.2 \
-    --far 100.0
+    #--near 0.2 \
+    #--far 100.0
 
 # echo ""
 # echo "=== Full-dataset evaluation ==="
