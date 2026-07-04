@@ -8,37 +8,37 @@
 #SBATCH --time=01:00:00
 #SBATCH --output=out/ngp-%A.out
 
-set -euo pipefail
-
+set -eo pipefail
 source $HOME/miniconda3/start1260.sh
 conda activate instant_ngp_sh
+
+set -u
 export PYTHONUNBUFFERED=1
 
 cd $HOME
 
 SCENE="bicycle"
 DATA="$HOME/mipnerf/$SCENE"
+DEPTH_DIR="$HOME/df-triangle/output/$SCENE/depth_ranges/ours_30000"
 OUT="$HOME/instant_ngp_sh/out/$SCENE"
 CKPT="$OUT/field.pt"
 
 python -u -m instant_ngp_sh.train \
     --data "$DATA" \
+    --depth_dir "$DEPTH_DIR" \
     --out "$OUT" \
     --images_dir images_4 \
-    --downscale 1 \
-    --sh_degree 3 \
-    --batch 16384 \
-    --eval_chunk 32768 \
-    #--near 0.2 \
-    #--far 100.0
+    --split train \
+    --sh_degree 4 \
+    --batch 65536
 
-# echo ""
-# echo "=== Full-dataset evaluation ==="
+echo ""
+echo "=== Test-split evaluation ==="
 
-# python -u -m instant_ngp_sh.render \
-#     --data "$DATA" \
-#     --ckpt "$CKPT" \
-#     --out "$OUT/render" \
-#     --split train \
-#     --images_dir images_4 \
-#     --downscale 1
+python -u -m instant_ngp_sh.render \
+    --data "$DATA" \
+    --depth_dir "$DEPTH_DIR" \
+    --ckpt "$CKPT" \
+    --out "$OUT/render" \
+    --split test \
+    --images_dir images_4

@@ -1,2 +1,6 @@
 __pycache__/
 notes/
+notebooks/
+data/
+out/
+*.pyc

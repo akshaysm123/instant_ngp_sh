@@ -1,4 +1,4 @@
-"""Loader for the COLMAP dataset format (MipNeRF360 / 3DGS style).
+"""COLMAP reconstruction reader utilities (MipNeRF360 / 3DGS style).
 
 Expected layout::
 
@@ -8,39 +8,31 @@ Expected layout::
     │   └── ...
     └── sparse/0/
         ├── cameras.bin         # (or cameras.txt)
-        ├── images.bin          # (or images.txt)
-        └── points3D.bin        # (or points3D.txt; optional, used for the scene AABB)
+        └── images.bin          # (or images.txt)
 
-This reads the COLMAP reconstruction directly, so the field trains in the **same world
-coordinate frame** COLMAP defines — which is exactly the frame a 3D Gaussian Splatting /
-surfel model trained on the *same* COLMAP uses. That is what makes the
-"color my splatting with this field" handoff (see ``notes/implementation_notes.md`` §9)
-work: a world point from the splatting can be fed straight into the field.
+This reads the COLMAP reconstruction directly, so the field lives in the **same world
+coordinate frame** COLMAP defines — which is exactly the frame a Gaussian-splatting model
+trained on the *same* COLMAP uses. That is what makes the "color my splatting with this
+field" handoff work: a world point from the splatting can be fed straight into the field.
+
+These helpers (camera/pose readers, intrinsics, ray generation) are consumed by
+:mod:`instant_ngp_sh.depth_dataset`.
 
 Conventions
 -----------
 COLMAP stores a world-to-camera transform ``(R, t)`` per image with the OpenCV camera
 convention (``+x`` right, ``+y`` down, ``+z`` forward). We convert to a camera-to-world
 matrix ``c2w`` (``R^T``, camera center ``-R^T t``) and generate rays in that convention.
-
-Unbounded scenes
-----------------
-MipNeRF360 scenes are unbounded. This module does **not** implement scene contraction;
-instead the renderer concentrates samples inside an axis-aligned box derived from the
-sparse point cloud (see ``compute_aabb``), using per-ray box intersection for near/far.
-The central, reconstructed region trains well; far background is only approximate. 
 """
 
 from __future__ import annotations
 
 import os
 import struct
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 try:  # imageio v2 API (avoids deprecation warnings on newer versions)
     import imageio.v2 as imageio
@@ -127,18 +119,6 @@ def read_images_binary(path: str) -> Dict[int, dict]:
     return images
 
 
-def read_points3D_binary(path: str) -> np.ndarray:
-    with open(path, "rb") as f:
-        n = _read(f, 8, "Q")[0]
-        xyz = np.empty((n, 3), dtype=np.float64)
-        for i in range(n):
-            d = _read(f, 43, "QdddBBBd")
-            xyz[i] = d[1:4]
-            track_len = _read(f, 8, "Q")[0]
-            f.seek(8 * track_len, os.SEEK_CUR)  # skip the track
-    return xyz
-
-
 # --------------------------------------------------------------------------- #
 # Text readers (fallback)                                                     #
 # --------------------------------------------------------------------------- #
@@ -174,18 +154,6 @@ def read_images_text(path: str) -> Dict[int, dict]:
     return images
 
 
-def read_points3D_text(path: str) -> np.ndarray:
-    pts = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            e = line.split()
-            pts.append([float(e[1]), float(e[2]), float(e[3])])
-    return np.array(pts, dtype=np.float64) if pts else np.zeros((0, 3))
-
-
 def _intrinsics_from_camera(cam: dict) -> Tuple[float, float, float, float]:
     """Extract ``(fx, fy, cx, cy)`` from a COLMAP camera dict (distortion ignored)."""
     p = cam["params"]
@@ -207,228 +175,15 @@ def _find_sparse_dir(root: str) -> str:
     )
 
 
-def _read_model(sparse_dir: str):
+def _read_model(sparse_dir: str) -> Tuple[Dict[int, dict], Dict[int, dict]]:
+    """Read the COLMAP cameras and images (binary preferred, text fallback)."""
     if os.path.exists(os.path.join(sparse_dir, "cameras.bin")):
         cameras = read_cameras_binary(os.path.join(sparse_dir, "cameras.bin"))
         images = read_images_binary(os.path.join(sparse_dir, "images.bin"))
     else:
         cameras = read_cameras_text(os.path.join(sparse_dir, "cameras.txt"))
         images = read_images_text(os.path.join(sparse_dir, "images.txt"))
-    xyz = None
-    for ext, reader in ((".bin", read_points3D_binary), (".txt", read_points3D_text)):
-        pp = os.path.join(sparse_dir, "points3D" + ext)
-        if os.path.exists(pp):
-            xyz = reader(pp)
-            break
-    return cameras, images, xyz
-
-
-@dataclass
-class ColmapDataset:
-    """Posed images from a COLMAP reconstruction (OpenCV camera convention).
-
-    Provides ``num_images``, ``sample_rays``, ``rays_for_image``, ``compute_aabb`` and
-    ``to`` (consumed by ``train.py`` / ``render.py``), with **per-image** intrinsics
-    ``(fx, fy, cx, cy)`` and a world frame identical to the COLMAP reconstruction.
-    """
-
-    images: torch.Tensor   # [N, H, W, 3]
-    c2w: torch.Tensor      # [N, 4, 4]
-    fx: torch.Tensor       # [N]
-    fy: torch.Tensor       # [N]
-    cx: torch.Tensor       # [N]
-    cy: torch.Tensor       # [N]
-    H: int
-    W: int
-    near: float
-    far: float
-    bg_color: Optional[torch.Tensor]
-    point_xyz: Optional[torch.Tensor] = None  # sparse points, for the AABB
-
-    @property
-    def focal(self) -> float:  # representative value, for logging
-        return float(self.fx[0])
-
-    @classmethod
-    def load(
-        cls,
-        root: str,
-        split: str = "train",
-        downscale: float = 1.0,
-        images_dir: str = "images",
-        holdout: int = 0,
-        white_background: bool = False,
-        near: Optional[float] = None,
-        far: Optional[float] = None,
-        max_images: Optional[int] = None,
-    ) -> "ColmapDataset":
-        """Load a COLMAP scene.
-
-        Args:
-            root: scene directory containing ``images/`` and ``sparse/``.
-            split: ``"train"``, ``"test"`` (or ``"all"``). With ``holdout > 0``, test is
-                every ``holdout``-th image (MipNeRF360 / 3DGS convention) and train is the rest.
-            downscale: resize images by this factor (intrinsics are scaled to match).
-            images_dir: image subfolder (e.g. ``"images_4"`` for the 4x downsampled set).
-            holdout: hold out every N-th image for the test split (default 0 = no holdout).
-            white_background: composite color for empty space (default black).
-            near, far: ray bounds; if ``None`` they are auto-estimated from the scene.
-            max_images: optionally cap the number of images.
-        """
-        sparse_dir = _find_sparse_dir(root)
-        cameras, images_meta, xyz = _read_model(sparse_dir)
-
-        items = sorted(images_meta.values(), key=lambda d: d["name"])
-        if holdout and holdout > 0 and split in ("train", "test"):
-            keep_train = lambda i: (i % holdout) != 0
-            items = [it for i, it in enumerate(items)
-                     if keep_train(i) == (split == "train")]
-        if max_images is not None:
-            items = items[:max_images]
-        if len(items) == 0:
-            raise RuntimeError(f"No images for split '{split}' (holdout={holdout}).")
-
-        img_root = os.path.join(root, images_dir)
-        imgs: List[torch.Tensor] = []
-        c2ws: List[np.ndarray] = []
-        fxs, fys, cxs, cys = [], [], [], []
-        target_hw: Optional[Tuple[int, int]] = None
-
-        for it in items:
-            cam = cameras[it["camera_id"]]
-            fx, fy, cx, cy = _intrinsics_from_camera(cam)
-            _warn_if_distorted(cam)
-
-            # Pose: COLMAP stores world-to-camera (R, t); we want camera-to-world.
-            # x_c = R * x_w + t   -->   R^T (x_c -t) = x_w
-            # c2w =     [ R^T   -t ] 
-            #           [ 0     1  ] 
-            R = qvec2rotmat(it["qvec"])
-            t = it["tvec"]
-            c2w = np.eye(4, dtype=np.float64)
-            c2w[:3, :3] = R.T
-            c2w[:3, 3] = -R.T @ t
-
-            rgb = torch.from_numpy(_load_image(_resolve(img_root, it["name"])))  # [h0,w0,3]
-            h0, w0 = rgb.shape[0], rgb.shape[1]
-
-            # Intrinsics are defined for the COLMAP camera resolution; scale to the
-            # actually-loaded image size (handles images_N folders) and the downscale.
-            sx = w0 / cam["width"]
-            sy = h0 / cam["height"]
-            new_h, new_w = int(round(h0 / downscale)), int(round(w0 / downscale))
-            if (new_h, new_w) != (h0, w0):
-                rgb = F.interpolate(rgb.permute(2, 0, 1)[None], size=(new_h, new_w),
-                                    mode="area")[0].permute(1, 2, 0).contiguous()
-            sx *= new_w / w0
-            sy *= new_h / h0
-
-            if target_hw is None:
-                target_hw = (new_h, new_w)
-            elif (new_h, new_w) != target_hw:
-                raise ValueError(
-                    "All images must share a resolution for batching; got "
-                    f"{(new_h, new_w)} vs {target_hw}. Use a single images_dir."
-                )
-
-            imgs.append(rgb)
-            c2ws.append(c2w)
-            fxs.append(fx * sx); fys.append(fy * sy)
-            cxs.append(cx * sx); cys.append(cy * sy)
-
-        images = torch.stack(imgs, 0).float()
-        c2w = torch.from_numpy(np.stack(c2ws, 0)).float()
-        fx = torch.tensor(fxs, dtype=torch.float32)
-        fy = torch.tensor(fys, dtype=torch.float32)
-        cx = torch.tensor(cxs, dtype=torch.float32)
-        cy = torch.tensor(cys, dtype=torch.float32)
-        H, W = target_hw
-
-        point_xyz = (torch.from_numpy(xyz).float()
-                     if xyz is not None and len(xyz) > 0 else None)
-
-        near_v, far_v = _auto_near_far(c2w, point_xyz, near, far)
-        bg = torch.ones(3) if white_background else torch.zeros(3)
-
-        return cls(images=images, c2w=c2w, fx=fx, fy=fy, cx=cx, cy=cy,
-                   H=int(H), W=int(W), near=near_v, far=far_v, bg_color=bg,
-                   point_xyz=point_xyz)
-
-    # -- interface consumed by train.py / render.py --------------------------
-
-    def num_images(self) -> int:
-        return self.images.shape[0]
-
-    def to(self, device, *, images_on_device: bool = True) -> "ColmapDataset":
-        """Move tensors to ``device``. Keep ``images`` on CPU when ``images_on_device=False``
-        to avoid storing the full image stack on the GPU (large scenes can exceed VRAM)."""
-        if images_on_device:
-            self.images = self.images.to(device)
-        self.c2w = self.c2w.to(device)
-        self.fx = self.fx.to(device); self.fy = self.fy.to(device)
-        self.cx = self.cx.to(device); self.cy = self.cy.to(device)
-        if self.bg_color is not None:
-            self.bg_color = self.bg_color.to(device)
-        if self.point_xyz is not None:
-            self.point_xyz = self.point_xyz.to(device)
-        return self
-
-    @property
-    def device(self) -> torch.device:
-        return self.c2w.device
-
-    def sample_rays(self, batch_size, generator=None):
-        device = self.device
-        n = self.num_images()
-        # sample random pixels in random images
-        img_idx = torch.randint(0, n, (batch_size,), generator=generator, device=device)
-        y = torch.randint(0, self.H, (batch_size,), generator=generator, device=device)
-        x = torch.randint(0, self.W, (batch_size,), generator=generator, device=device)
-        if self.images.device == device:
-            rgb = self.images[img_idx, y, x]
-        else:
-            rgb = self.images[img_idx.cpu(), y.cpu(), x.cpu()].to(device)
-
-        dirs = torch.stack(
-            [
-                # + 0.5 for pixel center
-                (x.float() + 0.5 - self.cx[img_idx]) / self.fx[img_idx],
-                (y.float() + 0.5 - self.cy[img_idx]) / self.fy[img_idx],
-                torch.ones(batch_size, device=device),
-            ],
-            dim=-1,
-        )  # OpenCV: +z forward, +y down
-        c2w = self.c2w[img_idx]
-        rays_d = torch.einsum("bij,bj->bi", c2w[:, :3, :3], dirs)
-        rays_o = c2w[:, :3, 3]
-        return rays_o, rays_d, rgb
-
-    def rays_for_image(self, idx: int):
-        return get_rays_pinhole(
-            self.H, self.W,
-            float(self.fx[idx]), float(self.fy[idx]),
-            float(self.cx[idx]), float(self.cy[idx]),
-            self.c2w[idx], opengl=False,
-        )
-
-    def compute_aabb(self, padding: float = 0.1) -> torch.Tensor:
-        """Robust AABB around the scene, from the sparse points if available.
-
-        Uses the 0.5-99.5 percentile of the point cloud to ignore COLMAP outliers, then
-        pads by ``padding`` of the extent. Falls back to the camera positions.
-        """
-        if self.point_xyz is not None and self.point_xyz.shape[0] >= 8:
-            pts = self.point_xyz
-            lo = torch.quantile(pts, 0.005, dim=0)
-            hi = torch.quantile(pts, 0.995, dim=0)
-        else:
-            cams = self.c2w[:, :3, 3]
-            lo = cams.min(0).values
-            hi = cams.max(0).values
-        extent = (hi - lo).clamp(min=1e-6)
-        lo = lo - padding * extent
-        hi = hi + padding * extent
-        return torch.cat([lo, hi]).to(torch.float32).cpu()
+    return cameras, images
 
 
 def get_rays_pinhole(H, W, fx, fy, cx, cy, c2w, opengl: bool = False):
@@ -442,7 +197,8 @@ def get_rays_pinhole(H, W, fx, fy, cx, cy, c2w, opengl: bool = False):
             (+y down, +z forward, the COLMAP convention).
 
     Returns:
-        ``rays_o, rays_d`` each ``[H, W, 3]`` in world space.
+        ``rays_o, rays_d`` each ``[H, W, 3]`` in world space. ``rays_d`` has camera-space
+        ``z = 1`` (OpenCV), so a point at view-space depth ``t`` is ``rays_o + t * rays_d``.
     """
     device = c2w.device
     j, i = torch.meshgrid(
@@ -459,28 +215,6 @@ def get_rays_pinhole(H, W, fx, fy, cx, cy, c2w, opengl: bool = False):
     rays_d = torch.einsum("ij,hwj->hwi", c2w[:3, :3], dirs)
     rays_o = c2w[:3, 3].expand_as(rays_d)
     return rays_o, rays_d
-
-
-def _auto_near_far(c2w, point_xyz, near, far) -> Tuple[float, float]:
-    """Estimate sensible scalar near/far from scene scale (used as clamps/fallbacks).
-
-    Per-ray near/far comes from AABB intersection in the renderer; these scalars only
-    bound rays that miss the box and provide a near floor.
-    """
-    if point_xyz is not None and point_xyz.shape[0] >= 8:
-        lo = torch.quantile(point_xyz, 0.005, dim=0)
-        hi = torch.quantile(point_xyz, 0.995, dim=0)
-        center = 0.5 * (lo + hi)
-        radius = 0.5 * float(torch.linalg.norm(hi - lo))
-    else:
-        cams = c2w[:, :3, 3]
-        center = cams.mean(0)
-        radius = float(torch.linalg.norm(cams - center, dim=1).max())
-    radius = max(radius, 1e-3)
-    cam_dists = torch.linalg.norm(c2w[:, :3, 3] - center, dim=1)
-    near_v = near if near is not None else max(1e-3, 0.02 * radius)
-    far_v = far if far is not None else float(cam_dists.max()) + 2.0 * radius
-    return float(near_v), float(far_v)
 
 
 def _resolve(img_root: str, name: str) -> str:
